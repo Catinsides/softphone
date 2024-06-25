@@ -14,6 +14,7 @@ import {
     OutgoingMessageEvent,
     OutgoingRTCSessionEvent
 } from "jssip/lib/UA";
+import { IncomingRequest, IncomingResponse } from "jssip/lib/SIPMessage";
 import {clearTimeout} from "timers";
 import * as timers from "timers";
 
@@ -44,6 +45,8 @@ type StunType = "turn" | "stun"
 
 //呼叫方向:outbound呼出;inbound:呼入
 type CallDirection = "outbound" | "inbound"
+
+type RTCIceCredentialType = "password" | "oauth"
 
 interface RTCIceServer {
     credential?: string;
@@ -147,7 +150,7 @@ export default class SipCall {
 
     //当前通话的网络延迟统计定时器(每秒钟获取网络情况)
     private currentLatencyStatTimer: NodeJS.Timer | undefined;
-    private currentStatReport: NetworkLatencyStat;
+    private currentStatReport!: NetworkLatencyStat;
 
     //回调函数
     private stateEventListener: Function | undefined;
@@ -185,19 +188,28 @@ export default class SipCall {
         // JsSIP.C.SESSION_EXPIRES=120,JsSIP.C.MIN_SESSION_EXPIRES=120;
         let proto = config.proto ? 'wss' : 'ws'
         let wsServer = proto + '://' + config.host + ':' + config.port
+
         this.socket = new jssip.WebSocketInterface(wsServer)
 
-        this.ua = new jssip.UA({
+        let uri = 'sip:' + config.extNo + '@' + config.domain
+        let options = {
             sockets: [this.socket],
-            uri: 'sip:' + config.extNo + '@' + config.domain,
+            uri: uri,
+            contact_uri: uri,
             password: config.extPwd,
             register: false,
-            register_expires: 15,
-            session_timers: false,
+            register_expires: 100,
+            session_timers: true,
+            connection_recovery_max_interval: 15,
+            session_timers_refresh_method: "UPDATE",
+            session_timers_force_refresher: true,
+            no_answer_timeout: 300,
             // connection_recovery_max_interval:30,
             // connection_recovery_min_interval:4,
             user_agent: 'JsSIP 3.9.0'
-        })
+        }
+
+        this.ua = new jssip.UA(options)
 
         //websocket连接成功
         this.ua.on('connected', (e) => {
@@ -231,7 +243,7 @@ export default class SipCall {
             this.ua.stop()
         })
         //Fired a few seconds before the registration expires
-        this.ua.on('registrationExpiring', (e) => {
+        this.ua.on('registrationExpiring', () => {
             // console.log("registrationExpiring")
             this.ua.register()
         })
@@ -303,9 +315,14 @@ export default class SipCall {
                 let evtData: CallEndEvent = {
                     answered: true,
                     cause: evt.cause,
-                    code: evt.message?.status_code ?? 0,
+                    code: 0,
                     originator: evt.originator
                 }
+
+                if (this.isIncomingResponse(evt.message)) {
+                    evtData.code = evt.message?.status_code ?? 0
+                }
+
                 this.cleanCallingData()
                 this.onChangeState(State.CALL_END, evtData)
             });
@@ -315,9 +332,14 @@ export default class SipCall {
                 let evtData: CallEndEvent = {
                     answered: false,
                     cause: evt.cause,
-                    code: evt.message?.status_code ?? 0,
+                    code: 0,
                     originator: evt.originator
                 }
+
+                if (this.isIncomingResponse(evt.message)) {
+                    evtData.code = evt.message?.status_code ?? 0
+                }
+
                 this.cleanCallingData()
                 this.onChangeState(State.CALL_END, evtData)
             })
@@ -358,7 +380,10 @@ export default class SipCall {
             outboundPacketsSent: 0,
             outboundLost: 0,
             inboundLost: 0,
-            inboundPacketsSent: 0
+            inboundPacketsSent: 0,
+            roundTripTime: 0,
+            outboundAudioLevel: 0,
+            inboundAudioLevel: 0
         }
         this.currentLatencyStatTimer = setInterval(() => {
             pc.getStats().then((stats) => {
@@ -428,7 +453,7 @@ export default class SipCall {
                     this.audioView.srcObject = media.streams[0];
                 }
             }
-        } else {
+        } /* else {
             //onaddstream方法被规范不建议使用
             pc.onaddstream = (media: {
                 stream: any;
@@ -438,7 +463,7 @@ export default class SipCall {
                     this.audioView.srcObject = remoteStream;
                 }
             }
-        }
+        } */
     }
 
     //清理一通通话的相关数据
@@ -457,11 +482,14 @@ export default class SipCall {
             outboundPacketsSent: 0,
             outboundLost: 0,
             inboundLost: 0,
-            inboundPacketsSent: 0
+            inboundPacketsSent: 0,
+            outboundAudioLevel: 0,
+            inboundAudioLevel: 0,
+            roundTripTime: 0
         }
     }
 
-    private onChangeState(event: String, data: StateListenerMessage | CallEndEvent | LatencyStat | null) {
+    private onChangeState(event: String, data: StateListenerMessage | CallEndEvent | LatencyStat | string | null | undefined) {
         if (undefined === this.stateEventListener) {
             return
         }
@@ -516,7 +544,6 @@ export default class SipCall {
                     iceTransportPolicy: "all",
                     iceServers: [{
                         username: this.stunConfig.username,
-                        credentialType: "password",
                         credential: this.stunConfig.password,
                         urls: [this.stunConfig.type + ':' + this.stunConfig.host],
                     }]
@@ -648,7 +675,7 @@ export default class SipCall {
 
     //麦克风检测
     public micCheck() {
-        navigator.permissions.query({name: "microphone"}).then((result) => {
+        navigator.permissions.query({ name: <any>"microphone"}).then((result) => {
             if (result.state == "denied") {
                 this.onChangeState(State.MIC_ERROR, {msg: "麦克风权限被禁用,请设置允许使用麦克风"});
                 return;
@@ -722,5 +749,9 @@ export default class SipCall {
         }
         return  await navigator.mediaDevices.enumerateDevices();
 
+    }
+
+    private isIncomingResponse(message: IncomingRequest | IncomingResponse): message is IncomingResponse {
+        return (message as IncomingResponse).status_code !== undefined;
     }
 }
